@@ -1,151 +1,122 @@
-// Implements a basic Account model, with support for creating/updating/deleting
-// users, along with welcome email and verification.
+use jelly::prelude::*;
+use jelly::accounts::User;
+use jelly::actix_web::{HttpRequest, web::{Path, Form}};
+use jelly::djangohashers::{make_password};
+use jelly::Result;
 
-use jelly::accounts::{User, OneTimeUseTokenGenerator};
-use jelly::djangohashers::{make_password, check_password};
-use jelly::serde::{Deserialize, Serialize};
-use jelly::chrono::{DateTime, Utc};
-use jelly::error::Error;
-use jelly::sqlx::{self, postgres::PgPool, FromRow, types::Json};
+use crate::accounts::Account;
+use crate::accounts::forms::{EmailForm, ChangePasswordForm};
+use crate::accounts::jobs::{SendPasswordWasResetEmail, SendResetPasswordEmail};
+use crate::accounts::views::utils::validate_token;
 
-use super::forms::{LoginForm, NewAccountForm};
-
-/// Personalized profile data that is a pain to make a needless JOIN
-/// for; just shove it in a jsonb field.
-#[derive(Debug, Serialize, Deserialize, FromRow)]
-pub struct Profile {}
-
-/// A user Account.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Account {
-    pub id: i32,
-    pub name: String,
-    pub email: String,
-    pub password: String,
-    pub profile: Json<Profile>,
-    pub plan: i32,
-    pub is_active: bool,
-    pub is_admin: bool,
-    pub has_verified_email: bool,
-    pub last_login: Option<DateTime<Utc>>,
-    pub created: DateTime<Utc>,
-    pub updated: DateTime<Utc>
+/// Just renders a standard "Enter Your Email" password reset page.
+pub async fn form(request: HttpRequest) -> Result<HttpResponse> {
+    request.render(200, "accounts/reset_password/index.html", {
+        let mut context = Context::new();
+        context.insert("form", &EmailForm::default());
+        context.insert("sent", &false);
+        context
+    })
 }
 
-impl Account {
-    pub async fn get(uid: i32, pool: &PgPool) -> Result<Self, Error> {
-        Ok(sqlx::query_as_unchecked!(Account, "
-            SELECT
-                id, name, email, password, profile, plan,
-                is_active, is_admin, has_verified_email,
-                last_login, created, updated
-            FROM accounts WHERE id = $1
-        ", uid).fetch_one(pool).await?)
+/// Processes the reset password request, which ultimately just passes
+/// it to a background worker to execute - we do this to avoid any timing
+/// attacks re: leaking user existence.
+pub async fn request_reset(
+    request: HttpRequest,
+    form: Form<EmailForm>
+) -> Result<HttpResponse> {
+    let mut form = form.into_inner();
+    if !form.is_valid() {
+        return request.render(400, "accounts/reset_password/index.html", {
+            let mut context = Context::new();
+            context.insert("form", &form);
+            context.insert("sent", &false);
+            context
+        });
     }
 
-    pub async fn get_by_email(email: &str, pool: &PgPool) -> Result<Self, Error> {
-        Ok(sqlx::query_as_unchecked!(Account, "
-            SELECT 
-                id, name, email, password, profile, plan,
-                is_active, is_admin, has_verified_email,
-                last_login, created, updated
-            FROM accounts WHERE email = $1
-        ", email).fetch_one(pool).await?)
+    request.queue(SendResetPasswordEmail {
+        to: form.email.value
+    })?;
+
+    request.render(200, "accounts/reset_password/requested.html", {
+        let mut context = Context::new();
+        context.insert("sent", &true);
+        context
+    })
+}
+
+/// Given a link (of form {uidb64}-{ts}-{token}), verifies the
+/// token and user, and presents them a change password form.
+///
+/// In general, we do not want to leak information, so any errors here
+/// should simply report as "invalid or expired". It's a bit verbose, but
+/// such is Rust for this type of thing. Write it once and move on. ;P
+pub async fn with_token(
+    request: HttpRequest,
+    Path((uidb64, ts, token)): Path<(String, String, String)>
+) -> Result<HttpResponse> {
+    if let Ok(_account) = validate_token(&request, &uidb64, &ts, &token).await {
+        return request.render(200, "accounts/reset_password/change_password.html", {
+            let mut context = Context::new();
+            context.insert("form", &ChangePasswordForm::default());
+            context.insert("uidb64", &uidb64);
+            context.insert("ts", &ts);
+            context.insert("token", &token);
+            context
+        });
     }
 
-    pub async fn authenticate(form: &LoginForm, pool: &PgPool) -> Result<User, Error> {
-        let user = sqlx::query!("
-            SELECT
-                id, name, password, is_admin
-            FROM accounts WHERE email = $1
-        ", form.email.value).fetch_one(pool).await?;
+    return request.render(200, "accounts/invalid_token.html", Context::new());
+}
 
-        if !check_password(&form.password, &user.password)? {
-            return Err(Error::InvalidPassword);
+/// Verifies the password is fine, and if so, signs the user in and redirects
+/// them to the dashboard with a flash message.
+pub async fn reset(
+    request: HttpRequest,
+    Path((uidb64, ts, token)): Path<(String, String, String)>,
+    form: Form<ChangePasswordForm>
+) -> Result<HttpResponse> {
+    let mut form = form.into_inner();
+    
+    if let Ok(account) = validate_token(&request, &uidb64, &ts, &token).await {       
+        // Note! This is a case where we need to fetch the user ahead of form validation.
+        // While it would be nice to avoid the DB hit, validating that their password is secure
+        // requires pulling some account values...
+        form.name = Some(account.name.clone());
+        form.email = Some(account.email.clone());
+
+        if !form.is_valid() {
+            return request.render(200, "accounts/reset_password/change_password.html", {
+                let mut context = Context::new();
+                context.insert("form", &form);
+                context
+            });
         }
 
-        Ok(User {
-            id: user.id,
-            name: user.name,
-            is_admin: user.is_admin,
+        let pool = request.db_pool()?;
+        let password = make_password(&form.password);
+        Account::update_password_and_last_login(account.id, &password, pool).await?;
+
+        request.queue(SendPasswordWasResetEmail {
+            to: account.email.clone()
+        })?;
+
+        request.set_user(User {
+            id: account.id,
+            name: account.name,
+            is_admin: account.is_admin,
             is_anonymous: false
-        })
+        })?;
+
+        request.flash("Password Reset", "Your password was successfully reset.")?;
+        return request.redirect("/dashboard/");
     }
     
-    pub async fn fetch_email(id: i32, pool: &PgPool) -> Result<(String, String), Error> {
-        let data = sqlx::query!("
-            SELECT
-                name, email
-            FROM accounts WHERE id = $1
-        ", id).fetch_one(pool).await?;
-
-        Ok((data.name, data.email))
-    }
-
-    pub async fn fetch_name_from_email(email: &str, pool: &PgPool) -> Result<String, Error> {
-        let data = sqlx::query!("
-            SELECT name FROM accounts WHERE email = $1
-        ", email).fetch_one(pool).await?;
-
-        Ok(data.name)
-    }
-
-    pub async fn register(form: &NewAccountForm, pool: &PgPool) -> Result<i32, Error> {
-        let password = make_password(&form.password);
-
-        Ok(sqlx::query!("
-            INSERT INTO accounts (name, email, password) 
-            VALUES ($1, $2, $3)
-            RETURNING id
-        ", form.name.value, form.email.value, password).fetch_one(pool).await?.id)
-    }
-
-    pub async fn mark_verified(id: i32, pool: &PgPool) -> Result<(), Error> {
-        sqlx::query!("
-            UPDATE accounts
-            SET has_verified_email = true, last_login = now()
-            WHERE id = $1
-        ", id).execute(pool).await?;
-
-        Ok(())
-    }
-
-    pub async fn update_last_login(id: i32, pool: &PgPool) -> Result<(), Error> {
-        sqlx::query!("
-            UPDATE accounts
-            SET last_login = now()
-            WHERE id = $1
-        ", id).execute(pool).await?;
-
-        Ok(())
-    }
-
-    pub async fn update_password_and_last_login(
-        id: i32,
-        password: &str,
-        pool: &PgPool
-    ) -> Result<(), Error> {
-        sqlx::query!("
-            UPDATE accounts
-            SET password = $2, last_login = now()
-            WHERE id = $1
-        ", id, password).execute(pool).await?;
-
-        Ok(())
-    }
-}
-
-impl OneTimeUseTokenGenerator for Account {
-    fn hash_value(&self) -> String {
-        format!(
-            "{}{}{}{}",
-            self.id,
-            self.password,
-            match self.last_login {
-                Some(ts) => format!("{}", ts.timestamp()),
-                None => "Unverified".to_string()
-            },
-            self.email
-        )
-    }
+    request.render(200, "accounts/reset_password/change_password.html", {
+        let mut context = Context::new();
+        context.insert("form", &form);
+        context
+    })
 }
